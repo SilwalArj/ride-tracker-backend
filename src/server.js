@@ -71,7 +71,19 @@ io.on("connection", (socket) => {
       lat: null,
       lng: null
     };
+    
+    socket.on("sendSOS", (data) => {
+    const { groupCode, userId, userName, lat, lng } = data;
 
+    console.log(`🚨 SOS from ${userName}`);
+
+    socket.to(groupCode).emit("receiveSOS", {
+      userId,
+      userName,
+      lat,
+      lng
+    });
+  });
     console.log(`👥 ${userId} joined group: ${groupCode}`);
   });
 
@@ -88,6 +100,7 @@ io.on("connection", (socket) => {
 
     socket.to(groupCode).emit("receiveLocation", {
       userId,
+      userName: data.userName,
       lat,
       lng
     });
