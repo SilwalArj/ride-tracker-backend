@@ -114,10 +114,13 @@ io.on("connection", (socket) => {
 
         delete groups[groupCode].members[socket.id];
 
+        // 🔥 send BOTH userId + userName
         io.to(groupCode).emit("userLeft", {
+          userId: user.userId,
           userName: user.userName
         });
 
+        // update members list
         io.to(groupCode).emit("groupMembers", {
           members: Object.values(groups[groupCode].members)
         });
