@@ -13,11 +13,11 @@ app.use(cors());
 app.use(express.json());
 
 mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log("  MongoDB connected"))
-  .catch((err) => console.log("  DB ERROR:", err));
+  .then(() => console.log("MongoDB connected"))
+  .catch((err) => console.log("DB ERROR:", err));
 
 app.get("/", (req, res) => {
-  res.send("Ride / Trek Tracker Backend Running");
+  res.send("Backend running");
 });
 
 function generateGroupCode() {
@@ -25,16 +25,6 @@ function generateGroupCode() {
 }
 
 const groups = {};
-/*
-groups = {
-  ABC123: {
-    members: {
-      socketId: { userId, lat, lng }
-    },
-    createdAt: Date
-  }
-}
-*/
 
 app.post("/api/group/create", (req, res) => {
   const groupCode = generateGroupCode();
@@ -44,22 +34,21 @@ app.post("/api/group/create", (req, res) => {
     createdAt: new Date()
   };
 
-  console.log(" Group created:", groupCode);
+  console.log("Group created:", groupCode);
 
   res.json({ groupCode });
 });
 
 const io = new Server(server, {
   cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
+    origin: "*"
   }
 });
 
 io.on("connection", (socket) => {
-  console.log(" User connected:", socket.id);
+  console.log("User connected:", socket.id);
 
-  socket.on("joinGroup", ({ groupCode, userId }) => {
+  socket.on("joinGroup", ({ groupCode, userId, userName }) => {
     if (!groups[groupCode]) {
       return socket.emit("errorMessage", "Group not found");
     }
@@ -68,50 +57,70 @@ io.on("connection", (socket) => {
 
     groups[groupCode].members[socket.id] = {
       userId,
+      userName,
       lat: null,
       lng: null
     };
-    
-    socket.on("sendSOS", (data) => {
-    const { groupCode, userId, userName, lat, lng } = data;
 
-    console.log(`🚨 SOS from ${userName}`);
+    console.log(`${userName} joined ${groupCode}`);
 
-    socket.to(groupCode).emit("receiveSOS", {
-      userId,
-      userName,
-      lat,
-      lng
+    // notify others
+    socket.to(groupCode).emit("userJoined", { userName });
+
+    // send full member list
+    io.to(groupCode).emit("groupMembers", {
+      members: Object.values(groups[groupCode].members)
     });
-  });
-    console.log(`👥 ${userId} joined group: ${groupCode}`);
   });
 
   socket.on("sendLocation", (data) => {
-    const { groupCode, userId, lat, lng } = data;
+    const { groupCode, userId, userName, lat, lng } = data;
 
     if (!groups[groupCode]) return;
 
     groups[groupCode].members[socket.id] = {
       userId,
+      userName,
       lat,
       lng
     };
 
     socket.to(groupCode).emit("receiveLocation", {
       userId,
-      userName: data.userName,
+      userName,
+      lat,
+      lng
+    });
+  });
+
+  socket.on("sendSOS", (data) => {
+    const { groupCode, userName, lat, lng } = data;
+
+    console.log(`SOS from ${userName}`);
+
+    socket.to(groupCode).emit("receiveSOS", {
+      userName,
       lat,
       lng
     });
   });
 
   socket.on("disconnect", () => {
-    console.log(" User disconnected:", socket.id);
+    console.log("User disconnected:", socket.id);
 
     for (const groupCode in groups) {
       if (groups[groupCode].members[socket.id]) {
+        const user = groups[groupCode].members[socket.id];
+
         delete groups[groupCode].members[socket.id];
+
+        io.to(groupCode).emit("userLeft", {
+          userName: user.userName
+        });
+
+        io.to(groupCode).emit("groupMembers", {
+          members: Object.values(groups[groupCode].members)
+        });
       }
     }
   });
@@ -120,5 +129,5 @@ io.on("connection", (socket) => {
 const PORT = process.env.PORT || 5000;
 
 server.listen(PORT, () => {
-  console.log(` Server running on port ${PORT}`);
+  console.log(`Server running on ${PORT}`);
 });
