@@ -45,87 +45,71 @@ const io = new Server(server, {
   }
 });
 
+const groups = {};
+
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
-  socket.on("joinGroup", ({ groupCode, userId, userName }) => {
-    if (!groups[groupCode]) {
-      return socket.emit("errorMessage", "Group not found");
-    }
+  socket.on("joinGroup", (data) => {
+    const { groupCode, userId, userName } = data;
 
     socket.join(groupCode);
 
-    groups[groupCode].members[socket.id] = {
-      userId,
-      userName,
-      lat: null,
-      lng: null
-    };
+    // CREATE GROUP IF NOT EXISTS
+    if (!groups[groupCode]) {
+      groups[groupCode] = [];
+    }
+
+    // PREVENT DUPLICATES
+    const exists = groups[groupCode].find(
+      (u) => u.userId === userId
+    );
+
+    if (!exists) {
+      groups[groupCode].push({
+        userId,
+        userName,
+      });
+    }
 
     console.log(`${userName} joined ${groupCode}`);
 
-    // notify others
-    socket.to(groupCode).emit("userJoined", { userName });
-
-    // send full member list
+    // SEND MEMBERS TO ROOM
     io.to(groupCode).emit("groupMembers", {
-      members: Object.values(groups[groupCode].members)
+      members: groups[groupCode],
+    });
+
+    // SEND JOIN NOTIFICATION
+    io.to(groupCode).emit("userJoined", {
+      userId,
+      userName,
+    });
+
+    // SEND GROUP CREATED
+    socket.emit("groupCreated", {
+      groupCode,
     });
   });
 
+  // LOCATION
   socket.on("sendLocation", (data) => {
-    const { groupCode, userId, userName, lat, lng } = data;
-
-    if (!groups[groupCode]) return;
-
-    groups[groupCode].members[socket.id] = {
-      userId,
-      userName,
-      lat,
-      lng
-    };
-
-    socket.to(groupCode).emit("receiveLocation", {
-      userId,
-      userName,
-      lat,
-      lng
-    });
+    socket.to(data.groupCode).emit(
+      "receiveLocation",
+      data
+    );
   });
 
+  // SOS
   socket.on("sendSOS", (data) => {
-    const { groupCode, userName, lat, lng } = data;
-
-    console.log(`SOS from ${userName}`);
-
-    socket.to(groupCode).emit("receiveSOS", {
-      userName,
-      lat,
-      lng
-    });
+    io.to(data.groupCode).emit(
+      "receiveSOS",
+      data
+    );
   });
 
+  // DISCONNECT
   socket.on("disconnect", () => {
-    console.log("User disconnected:", socket.id);
-
-    for (const groupCode in groups) {
-      if (groups[groupCode].members[socket.id]) {
-        const user = groups[groupCode].members[socket.id];
-
-        delete groups[groupCode].members[socket.id];
-
-        // 🔥 send BOTH userId + userName
-        io.to(groupCode).emit("userLeft", {
-          userId: user.userId,
-          userName: user.userName
-        });
-
-        // update members list
-        io.to(groupCode).emit("groupMembers", {
-          members: Object.values(groups[groupCode].members)
-        });
-      }
-    }
+    console.log("Disconnected:", socket.id);
   });
 });
 
