@@ -45,8 +45,6 @@ const io = new Server(server, {
   }
 });
 
-const groups = {};
-
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
