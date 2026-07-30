@@ -68,14 +68,12 @@ io.on("connection", (socket) => {
 
   // LIVE LOCATION
   socket.on("sendLocation", (data) => {
-    socket.to(data.groupCode).emit("receiveLocation", data);
-    console.log(
-      "LOCATION",
-      data.userName,
-      data.lat,
-      data.lng
-    );
-  });
+
+    console.log("LOCATION RECEIVED:", data);
+
+    io.to(data.groupCode).emit("receiveLocation", data);
+
+});
 
   // SOS
   socket.on("sendSOS", (data) => {
