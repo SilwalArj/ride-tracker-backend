@@ -68,12 +68,18 @@ io.on("connection", (socket) => {
 
   // LIVE LOCATION
   socket.on("sendLocation", (data) => {
+    console.log("========== LOCATION ==========");
+    console.log(data);
 
-    console.log("LOCATION RECEIVED:", data);
+    const room = io.sockets.adapter.rooms.get(data.groupCode);
 
-    io.to(data.groupCode).emit("receiveLocation", data);
+    console.log("ROOM USERS:",
+        room ? [...room] : "NO ROOM");
 
+    socket.to(data.groupCode).emit("receiveLocation", data);
 });
+
+
 
   // SOS
   socket.on("sendSOS", (data) => {
