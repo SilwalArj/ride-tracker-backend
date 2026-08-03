@@ -68,16 +68,17 @@ io.on("connection", (socket) => {
 
   // LIVE LOCATION
   socket.on("sendLocation", (data) => {
-    console.log("========== LOCATION ==========");
-    console.log(data);
 
-    const room = io.sockets.adapter.rooms.get(data.groupCode);
-
-    console.log("ROOM USERS:",
-        room ? [...room] : "NO ROOM");
+    console.log(
+        "SEND LOCATION:",
+        data.userName,
+        data.groupCode,
+        data.lat,
+        data.lng
+    );
 
     socket.to(data.groupCode).emit("receiveLocation", data);
-});
+  });
 
 
 
