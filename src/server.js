@@ -25,26 +25,28 @@ const PORT = process.env.PORT || 5000;
 //
 // groups = {
 //   ABC123: {
+//     leaderUserId: "...",
 //     members: [
 //       {
 //         socketId,
 //         userId,
-//         userName
+//         userName,
+//         groupType,
+//         lat,
+//         lng,
+//         heading,
+//         lastSeen
 //       }
 //     ],
-//
 //     tripPlan: {
 //       plannedByUserId,
 //       plannedByUserName,
+//       groupType,
 //       startPlace,
 //       endPlace,
-//       start: { lat, lng },
-//       destination: { lat, lng },
-//       routePoints: [
-//         { lat, lng },
-//         ...
-//       ],
-//       groupType,
+//       start,
+//       destination,
+//       routePoints,
 //       updatedAt
 //     }
 //   }
@@ -59,6 +61,7 @@ const groups = {};
 function getOrCreateGroup(groupCode) {
   if (!groups[groupCode]) {
     groups[groupCode] = {
+      leaderUserId: null,
       members: [],
       tripPlan: null,
     };
@@ -67,12 +70,127 @@ function getOrCreateGroup(groupCode) {
   return groups[groupCode];
 }
 
+function getPublicMembers(group) {
+  return group.members.map((member) => ({
+    userId: member.userId,
+    userName: member.userName,
+    groupType: member.groupType,
+    lat: member.lat,
+    lng: member.lng,
+    heading: member.heading,
+    lastSeen: member.lastSeen,
+  }));
+}
+
+function broadcastGroupInfo(groupCode) {
+  const group = groups[groupCode];
+
+  if (!group) return;
+
+  io.to(groupCode).emit("groupInfo", {
+    groupCode,
+    leaderUserId: group.leaderUserId,
+  });
+}
+
+function broadcastMembers(groupCode) {
+  const group = groups[groupCode];
+
+  if (!group) return;
+
+  io.to(groupCode).emit("groupMembers", {
+    members: getPublicMembers(group),
+  });
+}
+
+function broadcastLocationsToSocket(socket, groupCode) {
+  const group = groups[groupCode];
+
+  if (!group) return;
+
+  const locations = group.members
+    .filter(
+      (member) =>
+        member.lat !== null &&
+        member.lng !== null
+    )
+    .map((member) => ({
+      userId: member.userId,
+      userName: member.userName,
+      groupType: member.groupType,
+      lat: member.lat,
+      lng: member.lng,
+      heading: member.heading ?? 0,
+      lastSeen: member.lastSeen,
+    }));
+
+  socket.emit("groupLocations", {
+    locations,
+  });
+}
+
+function removeSocketFromGroup(socket, groupCode) {
+  const group = groups[groupCode];
+
+  if (!group) return null;
+
+  const index = group.members.findIndex(
+    (member) => member.socketId === socket.id
+  );
+
+  if (index === -1) {
+    return null;
+  }
+
+  const removedUser = group.members[index];
+
+  group.members.splice(index, 1);
+
+  // If the leader leaves, elect the first remaining member.
+  if (
+    removedUser.userId === group.leaderUserId
+  ) {
+    group.leaderUserId =
+      group.members.length > 0
+        ? group.members[0].userId
+        : null;
+  }
+
+  socket.leave(groupCode);
+
+  broadcastMembers(groupCode);
+  broadcastGroupInfo(groupCode);
+
+  io.to(groupCode).emit("userLeft", {
+    userId: removedUser.userId,
+    userName: removedUser.userName,
+  });
+
+  console.log(
+    `${removedUser.userName} left ${groupCode}`
+  );
+
+  // Delete empty group
+  if (group.members.length === 0) {
+    delete groups[groupCode];
+
+    console.log(
+      `Group ${groupCode} removed`
+    );
+  }
+
+  return removedUser;
+}
+
 // ======================================================
 // SOCKET CONNECTION
 // ======================================================
 
 io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
+  console.log(
+    "User connected:",
+    socket.id
+  );
 
   // ====================================================
   // JOIN GROUP
@@ -83,52 +201,104 @@ io.on("connection", (socket) => {
       groupCode,
       userId,
       userName,
+      groupType,
     } = data;
 
-    if (!groupCode || !userId || !userName) {
-      console.log("Invalid joinGroup data:", data);
+    if (
+      !groupCode ||
+      !userId ||
+      !userName
+    ) {
+      console.log(
+        "Invalid joinGroup data:",
+        data
+      );
       return;
     }
 
-    const group = getOrCreateGroup(groupCode);
+    const group =
+      getOrCreateGroup(groupCode);
+
+    // First user becomes leader.
+    if (!group.leaderUserId) {
+      group.leaderUserId = userId;
+    }
 
     socket.join(groupCode);
 
-    // Remove duplicate user entry
-    group.members = group.members.filter(
-      (user) => user.userId !== userId
-    );
+    socket.data.groupCode = groupCode;
+    socket.data.userId = userId;
 
-    // Add current user
+    // Remove duplicate user if same user reconnects.
+    group.members =
+      group.members.filter(
+        (member) =>
+          member.userId !== userId
+      );
+
     group.members.push({
       socketId: socket.id,
       userId,
       userName,
+      groupType: groupType ?? "unknown",
+
+      // We don't know location immediately.
+      lat: null,
+      lng: null,
+      heading: 0,
+      lastSeen: null,
     });
 
-    console.log(`${userName} joined ${groupCode}`);
+    const isLeader =
+      group.leaderUserId === userId;
 
-    // Send complete member list
-    io.to(groupCode).emit("groupMembers", {
-      members: group.members,
+    console.log(
+      `${userName} joined ${groupCode}`
+    );
+
+    console.log(
+      "Leader:",
+      group.leaderUserId
+    );
+
+    // Send group information to joining user.
+    socket.emit("groupInfo", {
+      groupCode,
+      leaderUserId:
+        group.leaderUserId,
+      isLeader,
     });
 
-    // Tell everyone that a user joined
-    io.to(groupCode).emit("userJoined", {
-      userId,
-      userName,
-    });
-
-    // Tell the joining user about the group
+    // Tell joining user that group is ready.
     socket.emit("groupCreated", {
       groupCode,
     });
 
-    // IMPORTANT:
-    // If a trip plan already exists,
-    // immediately send it to the newly joined user.
+    // Update everyone with members.
+    broadcastMembers(groupCode);
+
+    // Notify EVERYONE EXCEPT joining user.
+    socket.to(groupCode).emit(
+      "userJoined",
+      {
+        userId,
+        userName,
+      }
+    );
+
+    // Give the new rider the latest locations
+    // of everyone already in the group.
+    broadcastLocationsToSocket(
+      socket,
+      groupCode
+    );
+
+    // Give the new rider the current shared trip plan.
     if (group.tripPlan) {
-      socket.emit("tripPlanUpdated", group.tripPlan);
+      socket.emit(
+        "tripPlanUpdated",
+        group.tripPlan
+      );
     }
   });
 
@@ -141,12 +311,48 @@ io.on("connection", (socket) => {
       groupCode,
       userId,
       userName,
+      groupType,
       lat,
       lng,
+      heading,
     } = data;
 
-    if (!groupCode || !userId) {
+    if (
+      !groupCode ||
+      !userId ||
+      lat === undefined ||
+      lng === undefined
+    ) {
       return;
+    }
+
+    const group = groups[groupCode];
+
+    if (!group) {
+      return;
+    }
+
+    const member =
+      group.members.find(
+        (user) =>
+          user.userId === userId
+      );
+
+    if (member) {
+      member.lat = lat;
+      member.lng = lng;
+      member.heading =
+        typeof heading === "number"
+          ? heading
+          : 0;
+
+      member.lastSeen =
+        new Date().toISOString();
+
+      if (groupType) {
+        member.groupType =
+          groupType;
+      }
     }
 
     console.log(
@@ -154,24 +360,33 @@ io.on("connection", (socket) => {
       userName,
       groupCode,
       lat,
-      lng
+      lng,
+      heading
     );
 
-    // Broadcast to everyone else in this group
-    socket.to(groupCode).emit(
+    // Send to everyone in room.
+    // Flutter ignores its own userId.
+    io.to(groupCode).emit(
       "receiveLocation",
       {
         groupCode,
         userId,
         userName,
+        groupType,
         lat,
         lng,
+        heading:
+          typeof heading === "number"
+            ? heading
+            : 0,
+        lastSeen:
+          member?.lastSeen ?? null,
       }
     );
   });
 
   // ====================================================
-  // TRIP PLAN / DESTINATION
+  // SET SHARED TRIP PLAN
   // ====================================================
 
   socket.on("setTripPlan", (data) => {
@@ -187,38 +402,67 @@ io.on("connection", (socket) => {
       routePoints,
     } = data;
 
-    if (!groupCode) {
+    const group = groups[groupCode];
+
+    if (!group) {
       return;
     }
 
-    const group = getOrCreateGroup(groupCode);
+    // Only leader can change shared route.
+    if (
+      group.leaderUserId !== userId
+    ) {
+      socket.emit(
+        "tripPlanError",
+        {
+          message:
+            "Only the group leader can set the shared route.",
+        }
+      );
+
+      return;
+    }
 
     group.tripPlan = {
       plannedByUserId: userId,
       plannedByUserName: userName,
 
-      groupType: groupType ?? "unknown",
+      groupType:
+        groupType ?? "unknown",
 
-      startPlace: startPlace ?? "",
-      endPlace: endPlace ?? "",
+      startPlace:
+        startPlace ?? "",
 
-      start: start ?? null,
-      destination: destination ?? null,
+      endPlace:
+        endPlace ?? "",
 
-      routePoints: Array.isArray(routePoints)
+      start:
+        start ?? null,
+
+      destination:
+        destination ?? null,
+
+      routePoints:
+        Array.isArray(routePoints)
           ? routePoints
           : [],
 
-      updatedAt: new Date().toISOString(),
+      updatedAt:
+        new Date().toISOString(),
     };
 
     console.log(
-      `Trip plan updated in ${groupCode} by ${userName}`
+      `Trip plan updated in ${groupCode}`
+    );
+
+    console.log(
+      "Planner:",
+      userName
     );
 
     console.log(
       "Destination:",
-      group.tripPlan.destination
+      endPlace
     );
 
     console.log(
@@ -226,7 +470,7 @@ io.on("connection", (socket) => {
       group.tripPlan.routePoints.length
     );
 
-    // Send updated plan to EVERYONE in the group
+    // Everyone gets the same destination + route.
     io.to(groupCode).emit(
       "tripPlanUpdated",
       group.tripPlan
@@ -234,17 +478,28 @@ io.on("connection", (socket) => {
   });
 
   // ====================================================
-  // CLEAR TRIP PLAN
+  // CLEAR SHARED TRIP PLAN
   // ====================================================
 
   socket.on("clearTripPlan", (data) => {
-    const { groupCode } = data;
+    const {
+      groupCode,
+      userId,
+    } = data;
 
-    if (!groups[groupCode]) {
+    const group = groups[groupCode];
+
+    if (!group) {
       return;
     }
 
-    groups[groupCode].tripPlan = null;
+    if (
+      group.leaderUserId !== userId
+    ) {
+      return;
+    }
+
+    group.tripPlan = null;
 
     io.to(groupCode).emit(
       "tripPlanCleared"
@@ -272,7 +527,7 @@ io.on("connection", (socket) => {
       `SOS from ${userName} in ${groupCode}`
     );
 
-    // Everyone in the group receives SOS
+    // Everyone in the group receives it.
     io.to(groupCode).emit(
       "receiveSOS",
       {
@@ -286,6 +541,25 @@ io.on("connection", (socket) => {
   });
 
   // ====================================================
+  // EXPLICIT LEAVE
+  // ====================================================
+
+  socket.on("leaveGroup", (data) => {
+    const {
+      groupCode,
+    } = data;
+
+    if (!groupCode) {
+      return;
+    }
+
+    removeSocketFromGroup(
+      socket,
+      groupCode
+    );
+  });
+
+  // ====================================================
   // DISCONNECT
   // ====================================================
 
@@ -295,56 +569,17 @@ io.on("connection", (socket) => {
       socket.id
     );
 
-    for (const groupCode in groups) {
-      const group = groups[groupCode];
+    const groupCode =
+      socket.data.groupCode;
 
-      const user = group.members.find(
-        (member) =>
-          member.socketId === socket.id
-      );
-
-      if (!user) {
-        continue;
-      }
-
-      group.members = group.members.filter(
-        (member) =>
-          member.socketId !== socket.id
-      );
-
-      // Update member list
-      io.to(groupCode).emit(
-        "groupMembers",
-        {
-          members: group.members,
-        }
-      );
-
-      // Notify group
-      io.to(groupCode).emit(
-        "userLeft",
-        {
-          userId: user.userId,
-          userName: user.userName,
-        }
-      );
-
-      console.log(
-        `${user.userName} left ${groupCode}`
-      );
-
-      // Optional cleanup:
-      // Delete empty groups.
-      if (group.members.length === 0) {
-        delete groups[groupCode];
-
-        console.log(
-          `Group ${groupCode} removed`
-        );
-      }
-
-      break;
+    if (!groupCode) {
+      return;
     }
+
+    removeSocketFromGroup(
+      socket,
+      groupCode
+    );
   });
 });
 
