@@ -20,14 +20,11 @@ const io = new Server(server, {
 const PORT = process.env.PORT || 3000;
 
 // ============================================================
-// GROUP STORAGE
+// IN-MEMORY GROUP STORAGE
+// Field-test MVP only. Replace with DB/Redis for production.
 // ============================================================
 
 const groups = {};
-
-// ============================================================
-// HELPERS
-// ============================================================
 
 function getGroup(groupCode) {
   if (!groups[groupCode]) {
@@ -39,6 +36,27 @@ function getGroup(groupCode) {
   }
 
   return groups[groupCode];
+}
+
+function sanitizeMember(member) {
+  return {
+    userId: member.userId,
+    userName: member.userName,
+    lat: member.lat,
+    lng: member.lng,
+    heading: member.heading ?? 0,
+    lastSeen: member.lastSeen ?? null,
+  };
+}
+
+function emitMembers(groupCode) {
+  const group = groups[groupCode];
+
+  if (!group) return;
+
+  io.to(groupCode).emit("groupMembers", {
+    members: group.members.map(sanitizeMember),
+  });
 }
 
 // ============================================================
@@ -53,13 +71,12 @@ io.on("connection", (socket) => {
   // ==========================================================
 
   socket.on("joinGroup", (data) => {
-    const {
-      groupCode,
-      userId,
-      userName,
-    } = data;
+    const groupCode = String(data?.groupCode ?? "").trim();
+    const userId = String(data?.userId ?? "").trim();
+    const userName = String(data?.userName ?? "").trim();
 
     if (!groupCode || !userId || !userName) {
+      console.log("Invalid joinGroup payload:", data);
       return;
     }
 
@@ -67,9 +84,9 @@ io.on("connection", (socket) => {
 
     socket.join(groupCode);
 
-    // Remove duplicate user
+    // Remove an old socket entry for the same user.
     group.members = group.members.filter(
-      (user) => user.userId !== userId
+      (member) => member.userId !== userId
     );
 
     group.members.push({
@@ -79,56 +96,62 @@ io.on("connection", (socket) => {
       lat: null,
       lng: null,
       heading: 0,
+      lastSeen: null,
     });
 
-    console.log(
-      `${userName} joined ${groupCode}`
-    );
+    console.log(`${userName} joined ${groupCode}`);
 
-    // Send current members
-    io.to(groupCode).emit("groupMembers", {
-      members: group.members,
-    });
+    emitMembers(groupCode);
 
-    // Notify everyone
     io.to(groupCode).emit("userJoined", {
       userId,
       userName,
     });
 
-    // Send EXISTING trip plan specifically to the
-    // rider who just joined.
+    socket.emit("groupJoined", {
+      groupCode,
+    });
+
+    // Send existing trip to a late joiner.
     if (group.tripPlan) {
-      socket.emit(
-        "tripPlanUpdated",
-        group.tripPlan
-      );
-    if (group.sos) {
-     socket.emit(
-      "receiveSOS",
-      group.sos
-    );
-  }
+      socket.emit("tripPlanUpdated", group.tripPlan);
+
       console.log(
         `Sent existing trip plan to ${userName}`
       );
     }
-  });
 
+    // Send active SOS independently of trip plan.
+    if (group.sos) {
+      socket.emit("receiveSOS", group.sos);
+
+      console.log(
+        `Sent active SOS to ${userName}`
+      );
+    }
+  });
 
   // ==========================================================
   // LIVE LOCATION
   // ==========================================================
 
   socket.on("sendLocation", (data) => {
-    const {
-      groupCode,
-      userId,
-      userName,
-      lat,
-      lng,
-      heading,
-    } = data;
+    const groupCode = String(data?.groupCode ?? "").trim();
+    const userId = String(data?.userId ?? "").trim();
+    const userName = String(data?.userName ?? "").trim();
+
+    const lat = Number(data?.lat);
+    const lng = Number(data?.lng);
+    const heading = Number(data?.heading ?? 0);
+
+    if (
+      !groupCode ||
+      !userId ||
+      !Number.isFinite(lat) ||
+      !Number.isFinite(lng)
+    ) {
+      return;
+    }
 
     const group = groups[groupCode];
 
@@ -140,15 +163,36 @@ io.on("connection", (socket) => {
       (user) => user.userId === userId
     );
 
-    if (member) {
-      member.lat = lat;
-      member.lng = lng;
-      member.heading = heading ?? 0;
+    if (!member) {
+      console.log(
+        `Location ignored: ${userName} is not in group ${groupCode}`
+      );
+
+      return;
     }
 
+    member.lat = lat;
+    member.lng = lng;
+    member.heading = Number.isFinite(heading)
+      ? heading
+      : 0;
+
+    member.lastSeen = Date.now();
+
+    const locationData = {
+      groupCode,
+      userId,
+      userName,
+      lat,
+      lng,
+      heading: member.heading,
+      lastSeen: member.lastSeen,
+    };
+
+    // Do not send the location back to the sender.
     socket
       .to(groupCode)
-      .emit("receiveLocation", data);
+      .emit("receiveLocation", locationData);
 
     console.log(
       "SEND LOCATION:",
@@ -164,27 +208,47 @@ io.on("connection", (socket) => {
   // ==========================================================
 
   socket.on("broadcastTripPlan", (data) => {
-    const {
-      groupCode,
-      start,
-      end,
-      routePoints,
-      distance,
-      duration,
-      stops,
-    } = data;
+    const groupCode = String(
+      data?.groupCode ?? ""
+    ).trim();
+
+    if (!groupCode) return;
 
     const group = getGroup(groupCode);
 
     group.tripPlan = {
-      userId: data.userId,
-      userName: data.userName,
-      start,
-      end,
-      routePoints: routePoints || [],
-      distance: distance || 0,
-      duration: duration || 0,
-      stops: stops || [],
+      userId: String(
+        data?.userId ?? ""
+      ),
+
+      userName: String(
+        data?.userName ?? ""
+      ),
+
+      start: data?.start ?? null,
+
+      end: data?.end ?? null,
+
+      routePoints: Array.isArray(
+        data?.routePoints
+      )
+        ? data.routePoints
+        : [],
+
+      distance: Number(
+        data?.distance ?? 0
+      ),
+
+      duration: Number(
+        data?.duration ?? 0
+      ),
+
+      stops: Array.isArray(
+        data?.stops
+      )
+        ? data.stops
+        : [],
+
       updatedAt: Date.now(),
     };
 
@@ -203,13 +267,13 @@ io.on("connection", (socket) => {
   // ==========================================================
 
   socket.on("clearTripPlan", (data) => {
-    const { groupCode } = data;
+    const groupCode = String(
+      data?.groupCode ?? ""
+    ).trim();
 
     const group = groups[groupCode];
 
-    if (!group) {
-      return;
-    }
+    if (!group) return;
 
     group.tripPlan = null;
 
@@ -227,25 +291,51 @@ io.on("connection", (socket) => {
   // ==========================================================
 
   socket.on("sendSOS", (data) => {
-    const group = getGroup(data.groupCode);
+    const groupCode = String(
+      data?.groupCode ?? ""
+    ).trim();
+
+    if (!groupCode) return;
+
+    const group = getGroup(groupCode);
+
+    const lat = Number(data?.lat);
+    const lng = Number(data?.lng);
+
+    if (
+      !Number.isFinite(lat) ||
+      !Number.isFinite(lng)
+    ) {
+      return;
+    }
 
     group.sos = {
-      userId: data.userId,
-      userName: data.userName,
-      lat: data.lat,
-      lng: data.lng,
+      userId: String(
+        data?.userId ?? ""
+      ),
+
+      userName: String(
+        data?.userName ?? "Rider"
+      ),
+
+      lat,
+      lng,
+
+      testMode:
+        data?.testMode === true,
+
       timestamp: Date.now(),
     };
 
     console.log(
       "SOS:",
-      data.userName,
-      data.groupCode,
-      data.lat,
-      data.lng
+      group.sos.userName,
+      groupCode,
+      lat,
+      lng
     );
 
-    io.to(data.groupCode).emit(
+    io.to(groupCode).emit(
       "receiveSOS",
       group.sos
     );
@@ -256,20 +346,27 @@ io.on("connection", (socket) => {
   // ==========================================================
 
   socket.on("clearSOS", (data) => {
-    const group = groups[data.groupCode];
+    const groupCode = String(
+      data?.groupCode ?? ""
+    ).trim();
 
-    if (!group) {
-      return;
-    }
+    const group = groups[groupCode];
+
+    if (!group) return;
 
     group.sos = null;
 
-    io.to(data.groupCode).emit("sosCleared", {
-      userId: data.userId,
-    });
+    io.to(groupCode).emit(
+      "sosCleared",
+      {
+        userId: String(
+          data?.userId ?? ""
+        ),
+      }
+    );
 
     console.log(
-      `SOS CLEARED: ${data.groupCode}`
+      `SOS CLEARED: ${groupCode}`
     );
   });
 
@@ -278,30 +375,42 @@ io.on("connection", (socket) => {
   // ==========================================================
 
   socket.on("leaveGroup", (data) => {
-    const {
-      groupCode,
-      userId,
-      userName,
-    } = data;
+    const groupCode = String(
+      data?.groupCode ?? ""
+    ).trim();
+
+    const userId = String(
+      data?.userId ?? ""
+    ).trim();
+
+    const userName = String(
+      data?.userName ?? ""
+    ).trim();
 
     const group = groups[groupCode];
 
-    if (!group) {
+    if (!group) return;
+
+    const oldLength =
+      group.members.length;
+
+    group.members =
+      group.members.filter(
+        (member) =>
+          member.userId !== userId
+      );
+
+    if (
+      group.members.length ===
+      oldLength
+    ) {
+      socket.leave(groupCode);
       return;
     }
 
-    group.members = group.members.filter(
-      (user) => user.userId !== userId
-    );
-
     socket.leave(groupCode);
 
-    io.to(groupCode).emit(
-      "groupMembers",
-      {
-        members: group.members,
-      }
-    );
+    emitMembers(groupCode);
 
     io.to(groupCode).emit(
       "userLeft",
@@ -315,7 +424,9 @@ io.on("connection", (socket) => {
       `${userName} left ${groupCode}`
     );
 
-    if (group.members.length === 0) {
+    if (
+      group.members.length === 0
+    ) {
       delete groups[groupCode];
 
       console.log(
@@ -334,30 +445,31 @@ io.on("connection", (socket) => {
       socket.id
     );
 
-    for (const groupCode in groups) {
-      const group = groups[groupCode];
+    for (
+      const groupCode of Object.keys(
+        groups
+      )
+    ) {
+      const group =
+        groups[groupCode];
 
-      const user = group.members.find(
-        (member) =>
-          member.socketId === socket.id
-      );
+      const user =
+        group.members.find(
+          (member) =>
+            member.socketId ===
+            socket.id
+        );
 
-      if (!user) {
-        continue;
-      }
+      if (!user) continue;
 
       group.members =
         group.members.filter(
           (member) =>
-            member.socketId !== socket.id
+            member.socketId !==
+            socket.id
         );
 
-      io.to(groupCode).emit(
-        "groupMembers",
-        {
-          members: group.members,
-        }
-      );
+      emitMembers(groupCode);
 
       io.to(groupCode).emit(
         "userLeft",
@@ -368,8 +480,18 @@ io.on("connection", (socket) => {
       );
 
       console.log(
-        `${user.userName} left ${groupCode}`
+        `${user.userName} disconnected from ${groupCode}`
       );
+
+      if (
+        group.members.length === 0
+      ) {
+        delete groups[groupCode];
+
+        console.log(
+          `Group ${groupCode} deleted`
+        );
+      }
     }
   });
 });
@@ -388,8 +510,12 @@ app.get("/", (req, res) => {
 // START
 // ============================================================
 
-server.listen(PORT, () => {
-  console.log(
-    `Server running on port ${PORT}`
-  );
-});
+server.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
+    console.log(
+      `Server running on port ${PORT}`
+    );
+  }
+);
