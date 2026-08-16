@@ -19,6 +19,12 @@ const io = new Server(server, {
 
 const PORT = process.env.PORT || 3000;
 
+// How long a member stays in the group after their socket drops
+// before we actually remove them / reassign leadership. Covers
+// brief tunnels, elevators, and app-switch network blips during
+// the field test instead of nuking the member on the first hiccup.
+const DISCONNECT_GRACE_MS = 45000;
+
 // ============================================================
 // GROUP STORAGE
 // ============================================================
@@ -36,6 +42,7 @@ function getGroup(groupCode) {
       leaderId: null,
       tripPlan: null,
       activeSOS: null,
+      disconnectTimers: {},
     };
   }
 
@@ -64,6 +71,8 @@ function getPublicMembers(group) {
     lng: member.lng,
     heading: member.heading,
     isLeader: member.userId === group.leaderId,
+    connected: member.connected,
+    lastSeen: member.lastSeen,
   }));
 }
 
@@ -103,6 +112,19 @@ io.on("connection", (socket) => {
     if (existing) {
       existing.socketId = socket.id;
       existing.userName = userName;
+      existing.connected = true;
+      existing.lastSeen = Date.now();
+
+      // Cancel any pending removal from a previous disconnect —
+      // this is the reconnect-after-network-drop path.
+      if (group.disconnectTimers[userId]) {
+        clearTimeout(group.disconnectTimers[userId]);
+        delete group.disconnectTimers[userId];
+
+        console.log(
+          `${userName} reconnected to ${groupCode} within grace period`
+        );
+      }
     } else {
       group.members.push({
         socketId: socket.id,
@@ -111,6 +133,8 @@ io.on("connection", (socket) => {
         lat: null,
         lng: null,
         heading: 0,
+        connected: true,
+        lastSeen: Date.now(),
       });
     }
 
@@ -231,6 +255,8 @@ io.on("connection", (socket) => {
       typeof heading === "number"
         ? heading
         : 0;
+    member.connected = true;
+    member.lastSeen = Date.now();
 
     socket.to(groupCode).emit(
       "receiveLocation",
@@ -241,6 +267,7 @@ io.on("connection", (socket) => {
         lat,
         lng,
         heading: member.heading,
+        lastSeen: member.lastSeen,
       }
     );
 
@@ -560,6 +587,11 @@ io.on("connection", (socket) => {
 
   // ==========================================================
   // DISCONNECT
+  // Do NOT remove the member immediately — a dropped socket during
+  // a tunnel, elevator, or brief signal loss should not boot the
+  // rider from the group or hand off leadership. Mark them
+  // disconnected, tell the group right away, and only actually
+  // remove them if they haven't reconnected within the grace period.
   // ==========================================================
 
   socket.on("disconnect", () => {
@@ -569,103 +601,124 @@ io.on("connection", (socket) => {
     );
 
     for (const groupCode in groups) {
-      const group =
-        groups[groupCode];
+      const group = groups[groupCode];
 
-      const user =
-        group.members.find(
-          (member) =>
-            member.socketId ===
-            socket.id
-        );
+      const user = group.members.find(
+        (member) => member.socketId === socket.id
+      );
 
       if (!user) {
         continue;
       }
 
-      const wasLeader =
-        group.leaderId ===
-        user.userId;
-
-      group.members =
-        group.members.filter(
-          (member) =>
-            member.socketId !==
-            socket.id
-        );
-
-      // ------------------------------------------------------
-      // Assign new leader
-      // ------------------------------------------------------
-
-      if (
-        wasLeader &&
-        group.members.length > 0
-      ) {
-        group.leaderId =
-          group.members[0].userId;
-
-        console.log(
-          `${group.members[0].userName} became leader`
-        );
-
-        io.to(groupCode).emit(
-          "leaderChanged",
-          {
-            leaderId:
-              group.leaderId,
-          }
-        );
-      }
-
-      // ------------------------------------------------------
-      // Empty group
-      // ------------------------------------------------------
-
-      if (
-        group.members.length === 0
-      ) {
-        delete groups[groupCode];
-
-        console.log(
-          `Deleted empty group ${groupCode}`
-        );
-
-        continue;
-      }
-
-      // ------------------------------------------------------
-      // Update members
-      // ------------------------------------------------------
-
-      io.to(groupCode).emit(
-        "groupMembers",
-        {
-          members:
-            getPublicMembers(group),
-
-          leaderId:
-            group.leaderId,
-        }
-      );
-
-      io.to(groupCode).emit(
-        "userLeft",
-        {
-          userId:
-            user.userId,
-
-          userName:
-            user.userName,
-        }
-      );
+      user.connected = false;
+      user.lastSeen = Date.now();
 
       console.log(
-        `${user.userName} disconnected from ${groupCode}`
+        `${user.userName} disconnected from ${groupCode} — ` +
+          `waiting ${DISCONNECT_GRACE_MS / 1000}s for reconnect`
       );
+
+      // Let everyone know this rider's connection dropped, without
+      // pulling them off the map or reassigning leadership yet.
+      io.to(groupCode).emit("groupMembers", {
+        members: getPublicMembers(group),
+        leaderId: group.leaderId,
+      });
+
+      const removedUserId = user.userId;
+      const removedSocketId = socket.id;
+
+      if (group.disconnectTimers[removedUserId]) {
+        clearTimeout(group.disconnectTimers[removedUserId]);
+      }
+
+      group.disconnectTimers[removedUserId] = setTimeout(() => {
+        finalizeDisconnect(groupCode, removedUserId, removedSocketId);
+      }, DISCONNECT_GRACE_MS);
     }
   });
 });
+
+// ============================================================
+// FINALIZE DISCONNECT
+// Runs after the grace period. Actually removes the member,
+// reassigns leadership, and deletes the group if now empty —
+// but only if they never reconnected in the meantime.
+// ============================================================
+
+function finalizeDisconnect(groupCode, userId, socketId) {
+  const group = groups[groupCode];
+
+  if (!group) {
+    return;
+  }
+
+  delete group.disconnectTimers[userId];
+
+  const user = findMember(group, userId);
+
+  if (!user) {
+    // Already removed some other way.
+    return;
+  }
+
+  // They reconnected (possibly with a new socket) since the
+  // disconnect fired — do not remove them.
+  if (user.connected || user.socketId !== socketId) {
+    return;
+  }
+
+  const wasLeader = group.leaderId === user.userId;
+
+  group.members = group.members.filter(
+    (member) => member.userId !== userId
+  );
+
+  // ------------------------------------------------------
+  // Assign new leader
+  // ------------------------------------------------------
+
+  if (wasLeader && group.members.length > 0) {
+    group.leaderId = group.members[0].userId;
+
+    console.log(`${group.members[0].userName} became leader`);
+
+    io.to(groupCode).emit("leaderChanged", {
+      leaderId: group.leaderId,
+    });
+  }
+
+  // ------------------------------------------------------
+  // Empty group
+  // ------------------------------------------------------
+
+  if (group.members.length === 0) {
+    delete groups[groupCode];
+
+    console.log(`Deleted empty group ${groupCode}`);
+
+    return;
+  }
+
+  // ------------------------------------------------------
+  // Update members
+  // ------------------------------------------------------
+
+  io.to(groupCode).emit("groupMembers", {
+    members: getPublicMembers(group),
+    leaderId: group.leaderId,
+  });
+
+  io.to(groupCode).emit("userLeft", {
+    userId: user.userId,
+    userName: user.userName,
+  });
+
+  console.log(
+    `${user.userName} removed from ${groupCode} after grace period`
+  );
+}
 
 // ============================================================
 // HEALTH CHECK
